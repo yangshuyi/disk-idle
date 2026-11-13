@@ -1,10 +1,11 @@
 #!/bin/bash
-# disk-idle: 监控 USB 硬盘盒里各磁盘的读写量，闲置超过设定时间后让硬盘休眠（停转）。
+# disk-idle: 监控 USB 硬盘盒里各磁盘的真实读写量，把硬盘盒固件的休眠时间"延长"到设定值。
 # - 使用期内定时直读整盘第 0 扇区保活，阻止硬盘盒固件提前休眠（如 Orico 30 秒）
+# - 闲置满设定时间后停止保活，由硬盘盒固件自动让硬盘停转（脚本不发休眠命令）
 # - 每个检测周期重新扫描磁盘，硬盘盒插上/拔掉/重新识别（sdX 变化）都能自动跟上
 # - 按 by-id 识别磁盘，盘符变化不影响计时
 # - 读写量取自 /sys/block/sdX/stat（内核内存统计，读取不会访问硬盘）
-# - 已休眠的盘不会被重复发送休眠命令；一旦有读写（被唤醒）重新计时
+# - 停止保活后，一旦有超过阈值的真实读写，恢复保活并重新计时
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -53,18 +54,6 @@ scan_disks() {
     done
 }
 
-spin_down() {   # $1=id $2=dev
-    if [ "$DRY_RUN" = "1" ]; then
-        log "[DRY_RUN] 将休眠 $1 (/dev/$2)"; return 0
-    fi
-    if hdparm -y "/dev/$2" >/dev/null 2>&1; then
-        log "已休眠 $1 (/dev/$2)"; return 0
-    fi
-    if command -v sdparm >/dev/null && sdparm --readonly --command=stop "/dev/$2" >/dev/null 2>&1; then
-        log "已休眠 $1 (/dev/$2)（sdparm）"; return 0
-    fi
-    log "休眠失败 $1 (/dev/$2)：硬盘盒可能不转发休眠命令"; return 1
-}
 
 # 真实读写量（扇区数）：优先统计分区（文件系统的读写都走分区）；
 # 保活读的是整盘设备第 0 扇区，只计入整盘统计、不计入分区统计，因此不会被当成"有人在用"。
@@ -92,7 +81,7 @@ keepalive() {   # $1=id $2=dev
     fi
 }
 
-log "启动：周期 ${CHECK_INTERVAL}s，闲置 ${IDLE_TIMEOUT}s 后休眠，阈值 ${MIN_ACTIVITY_KB}KB/周期，DISKS=$DISKS EXCLUDE=$EXCLUDE DRY_RUN=$DRY_RUN"
+log "启动：周期 ${CHECK_INTERVAL}s，闲置 ${IDLE_TIMEOUT}s 后停止保活，阈值 ${MIN_ACTIVITY_KB}KB/周期，DISKS=$DISKS EXCLUDE=$EXCLUDE DRY_RUN=$DRY_RUN"
 
 declare -A KA_SECTORS
 while true; do
@@ -118,22 +107,18 @@ while true; do
         idle=$(( now - LAST_ACTIVE[$id] ))
         [ "$DRY_RUN" = "1" ] && log "  $id 本周期真实读写 ${delta_kb}KB，已闲置 ${idle}s"
 
-        # 休眠后只要有任何真实读写，盘就已经被唤醒了：标记为醒着，以便之后再次休眠
-        if [ "${ASLEEP[$id]}" = "1" ] && [ "$delta_kb" -gt 0 ]; then
-            log "$id 被唤醒（读写 ${delta_kb}KB）"
-            ASLEEP[$id]=0
-        fi
-        # 超过阈值才算真正在用，重新计时；小读写（如 ls）不重置计时
+        # 超过阈值才算真正在用，重新计时；小读写（如 ls）不重置计时，也不恢复保活
         if [ "$delta_kb" -gt "$MIN_ACTIVITY_KB" ]; then
-            LAST_ACTIVE[$id]=$now; idle=0
+            [ "${ASLEEP[$id]}" = "1" ] && log "$id 有读写 ${delta_kb}KB，恢复保活"
+            LAST_ACTIVE[$id]=$now; idle=0; ASLEEP[$id]=0
         fi
 
         if [ "$idle" -lt "$IDLE_TIMEOUT" ]; then
             # 还在使用期内：读一下，阻止硬盘盒固件提前休眠
             keepalive "$id" "$dev"
         elif [ "${ASLEEP[$id]}" = "0" ]; then
-            log "$id 已闲置 $((idle / 60)) 分钟"
-            spin_down "$id" "$dev" && ASLEEP[$id]=1
+            log "$id 已闲置 $((idle / 60)) 分钟，停止保活，交给硬盘盒自动休眠"
+            ASLEEP[$id]=1
         fi
     done < <(scan_disks)
 
